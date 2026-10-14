@@ -5,6 +5,37 @@ All notable changes to ApplyPilot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1+custom.1] - 2026-10-14
+
+Custom fork release ([Arthur5272/ApplyPilot](https://github.com/Arthur5272/ApplyPilot)), based on upstream 0.3.0.
+
+### Added
+- **LLM model fallback rotation** - new `LLM_MODEL_FALLBACKS` env var (comma-separated
+  models on the same provider/API key). When a model exhausts its retry ladder the client
+  rotates to the next model in the pool instead of failing the run.
+- **Gemini daily-quota detection** - a 429 whose body mentions a `PerDay` quota marks that
+  model as exhausted for the rest of the process, so it is skipped instead of retried.
+
+### Changed
+- **Rate-limit backoff** - retries on 429/503/timeouts now use exponential shares
+  (1:2:4:8) that add up to a 7-minute total budget per model, replacing the old
+  10s-doubling schedule capped at 60s. Rotation only happens after the full budget is
+  spent, so short per-minute throttles don't abandon a healthy model.
+- **Incremental DB persistence** - scoring, resume tailoring and cover-letter generation
+  now commit after every job instead of once at the end of the batch. An interrupted run
+  (Ctrl+C, quota exhaustion, crash) keeps all work done so far.
+
+### Fixed
+- **Failed scores stuck at 0** - when the LLM call fails, `fit_score` is left `NULL` so
+  the job stays pending and is retried on the next run, instead of being stored as a fake 0.
+- **`<thought>` blocks breaking JSON extraction** - smart extract now strips
+  `<thought>...</thought>` output (Gemini thinking models), in addition to `<think>`.
+- **Chrome failing silently without a display** - auto-apply forces headless Chrome when
+  neither `DISPLAY` nor `WAYLAND_DISPLAY` is set, instead of surfacing confusing
+  `browser_unavailable` / connection-refused errors on every job.
+- **Fork tags triggering PyPI publish** - the publish workflow only runs on the upstream
+  repository.
+
 ## [0.2.0] - 2026-02-17
 
 ### Added

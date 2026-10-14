@@ -2,6 +2,8 @@
 
 > **⚠️ ApplyPilot** is the original open-source project, created by [Pickle-Pixel](https://github.com/Pickle-Pixel) and first published on GitHub on **February 17, 2026**. We are **not affiliated** with applypilot.app, useapplypilot.com, or any other product using the "ApplyPilot" name. These sites are **not associated with this project** and may misrepresent what they offer. If you're looking for the autonomous, open-source job application agent — you're in the right place.
 
+> **🔧 Custom fork:** this is [Arthur5272/ApplyPilot](https://github.com/Arthur5272/ApplyPilot), a fork of [Pickle-Pixel/ApplyPilot](https://github.com/Pickle-Pixel/ApplyPilot) with LLM model fallback rotation, incremental (crash-safe) DB persistence and a few robustness fixes. See [CHANGELOG.md](CHANGELOG.md) for details. Install with `pip install git+https://github.com/Arthur5272/ApplyPilot@v0.3.1-custom.1`.
+
 # ApplyPilot
 
 **Applied to 1,000 jobs in 2 days. Fully autonomous. Open source.**
@@ -117,7 +119,9 @@ Your personal data in one structured file: contact info, work authorization, com
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional).
+API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `LLM_MODEL_FALLBACKS`, `CAPSOLVER_API_KEY` (optional).
+
+`LLM_MODEL_FALLBACKS` is an optional comma-separated list of extra models on the same provider/API key (e.g. `gemini-2.5-flash,gemini-2.0-flash-lite`). When the current model exhausts its retry budget -- or hits a Gemini *daily* quota -- ApplyPilot rotates to the next model instead of failing the run.
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
