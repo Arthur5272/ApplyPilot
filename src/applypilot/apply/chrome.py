@@ -201,6 +201,20 @@ def launch_chrome(worker_id: int, port: int | None = None,
     if port is None:
         port = BASE_CDP_PORT + worker_id
 
+    # A windowed Chrome can't start at all without a display server -- it exits
+    # immediately ("Missing X server or $DISPLAY") without ever opening the CDP
+    # port, which then shows up downstream as a confusing "browser_unavailable /
+    # connection refused" on every subsequent job. Auto-force headless in that
+    # case instead of silently failing.
+    import os
+    if not headless and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        logger.warning(
+            "[worker-%d] No DISPLAY/WAYLAND_DISPLAY detected -- forcing headless "
+            "Chrome (a windowed browser can't start in this environment).",
+            worker_id,
+        )
+        headless = True
+
     profile_dir = setup_worker_profile(worker_id)
 
     # Kill any zombie Chrome from a previous run on this port
