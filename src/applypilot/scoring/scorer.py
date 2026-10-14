@@ -142,24 +142,27 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         result["url"] = job["url"]
         completed += 1
 
+        results.append(result)
+
+        # Commit immediately so an interrupted run (Ctrl+C, quota exhaustion)
+        # keeps every score computed so far instead of losing the whole batch.
+        # score == 0 means the LLM call failed (see score_job's except clause) --
+        # leave fit_score NULL so the job stays in "pending_score" and gets
+        # retried next run, instead of being permanently stuck at a fake 0.
         if result["score"] == 0:
             errors += 1
-
-        results.append(result)
+        else:
+            conn.execute(
+                "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+                (result["score"], f"{result['keywords']}\n{result['reasoning']}",
+                 datetime.now(timezone.utc).isoformat(), result["url"]),
+            )
+            conn.commit()
 
         log.info(
             "[%d/%d] score=%d  %s",
             completed, len(jobs), result["score"], job.get("title", "?")[:60],
         )
-
-    # Write scores to DB
-    now = datetime.now(timezone.utc).isoformat()
-    for r in results:
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
-        )
-    conn.commit()
 
     elapsed = time.time() - t0
     log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)

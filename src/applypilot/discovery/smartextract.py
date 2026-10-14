@@ -658,6 +658,10 @@ def extract_json(text: str) -> dict:
         after = text.split("</think>")[-1].strip()
         if after:
             text = after
+    if "<thought>" in text:
+        after = text.split("</thought>")[-1].strip()
+        if after:
+            text = after
     if "```json" in text:
         text = text.split("```json")[1].split("```")[0]
     elif "```" in text:

@@ -8,6 +8,8 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Only the upstream repo publishes to PyPI -- forks (e.g. custom builds) skip this job.
+    if: github.repository == 'Pickle-Pixel/ApplyPilot'
     environment: pypi
     permissions:
       id-token: write  # required for OIDC trusted publishing
