@@ -21,22 +21,31 @@ log = logging.getLogger(__name__)
 # Provider detection
 # ---------------------------------------------------------------------------
 
-def _detect_provider() -> tuple[str, str, str]:
-    """Return (base_url, model, api_key) based on environment variables.
+def _detect_provider() -> tuple[str, str, str, list[str]]:
+    """Return (base_url, model, api_key, fallback_models) based on environment variables.
 
     Reads env at call time (not module import time) so that load_env() called
     in _bootstrap() is always visible here.
+
+    LLM_MODEL_FALLBACKS is a comma-separated list of additional models to
+    rotate through (same provider/base_url) when the primary model hits its
+    daily quota -- e.g. multiple free-tier Gemini models, each with its own
+    independent daily request budget.
     """
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
+    fallbacks = [
+        m.strip() for m in os.environ.get("LLM_MODEL_FALLBACKS", "").split(",") if m.strip()
+    ]
 
     if gemini_key and not local_url:
         return (
             "https://generativelanguage.googleapis.com/v1beta/openai",
             model_override or "gemini-2.0-flash",
             gemini_key,
+            fallbacks,
         )
 
     if openai_key and not local_url:
@@ -44,6 +53,7 @@ def _detect_provider() -> tuple[str, str, str]:
             "https://api.openai.com/v1",
             model_override or "gpt-4o-mini",
             openai_key,
+            fallbacks,
         )
 
     if local_url:
@@ -51,6 +61,7 @@ def _detect_provider() -> tuple[str, str, str]:
             local_url.rstrip("/"),
             model_override or "local-model",
             os.environ.get("LLM_API_KEY", ""),
+            fallbacks,
         )
 
     raise RuntimeError(
@@ -66,13 +77,43 @@ def _detect_provider() -> tuple[str, str, str]:
 _MAX_RETRIES = 5
 _TIMEOUT = 120  # seconds
 
-# Base wait on first 429/503 (doubles each retry, caps at 60s).
-# Gemini free tier is 15 RPM = 4s minimum between requests; 10s gives headroom.
-_RATE_LIMIT_BASE_WAIT = 10
+# Total time spent waiting on 429/503 for a single model before giving up on
+# it and rotating to the next one in the pool. Split across the N-1 wait slots
+# (the last attempt doesn't wait) as an exponential share (1:2:4:8:...) so it
+# still backs off, but the SUM across all cycles is the number below -- not
+# each individual cycle capped at it.
+_RATE_LIMIT_TOTAL_WAIT = 420  # 7 min
+
+
+def _backoff_schedule(n_waits: int, total: float) -> list[float]:
+    """Exponential shares (1, 2, 4, ...) that sum to exactly `total`."""
+    if n_waits <= 0:
+        return []
+    weights = [2 ** i for i in range(n_waits)]
+    share = total / sum(weights)
+    return [w * share for w in weights]
+
+
+_BACKOFF_SCHEDULE = _backoff_schedule(_MAX_RETRIES - 1, _RATE_LIMIT_TOTAL_WAIT)
 
 
 _GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 _GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def _is_daily_quota_error(resp: httpx.Response) -> bool:
+    """Detect a 429 caused by a *daily* quota (RPD), not a per-minute throttle.
+
+    Waiting out a per-minute rate limit makes sense; waiting out a daily quota
+    doesn't -- it won't reset for hours. Google's error body names the quota
+    (e.g. "GenerateRequestsPerDayPerProjectPerModel-FreeTier"), so we just
+    look for "PerDay" in the raw response text rather than depend on the
+    exact JSON shape.
+    """
+    try:
+        return "PerDay" in resp.text
+    except Exception:
+        return False
 
 
 class LLMClient:
@@ -82,9 +123,15 @@ class LLMClient:
     happens with preview/experimental models not exposed via compat), it
     automatically switches to the native generateContent API and stays there
     for the lifetime of the process.
+
+    Supports rotating across multiple models (fallback_models) that share the
+    same provider/API key but have independent daily quotas -- when one hits
+    RESOURCE_EXHAUSTED for the day, the client switches to the next and
+    remembers not to try the exhausted one again for the rest of the process.
     """
 
-    def __init__(self, base_url: str, model: str, api_key: str) -> None:
+    def __init__(self, base_url: str, model: str, api_key: str,
+                 fallback_models: list[str] | None = None) -> None:
         self.base_url = base_url
         self.model = model
         self.api_key = api_key
@@ -92,6 +139,20 @@ class LLMClient:
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
+
+        # Ordered pool of models to try: primary first, then fallbacks (deduped).
+        self._model_pool: list[str] = [model] + [
+            m for m in (fallback_models or []) if m != model
+        ]
+        self._daily_exhausted: set[str] = set()
+
+    def _next_available_model(self, exclude: set[str] | None = None) -> str | None:
+        """First pool model that isn't daily-exhausted or in `exclude`, or None."""
+        exclude = exclude or set()
+        for m in self._model_pool:
+            if m not in self._daily_exhausted and m not in exclude:
+                return m
+        return None
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -191,79 +252,121 @@ class LLMClient:
         temperature: float = 0.0,
         max_tokens: int = 4096,
     ) -> str:
-        """Send a chat completion request and return the assistant message text."""
-        # Qwen3 optimization: prepend /no_think to skip chain-of-thought
-        # reasoning, saving tokens on structured extraction tasks.
-        if "qwen" in self.model.lower() and messages:
-            first = messages[0]
-            if first.get("role") == "user" and not first["content"].startswith("/no_think"):
-                messages = [{"role": first["role"], "content": f"/no_think\n{first['content']}"}] + messages[1:]
+        """Send a chat completion request and return the assistant message text.
 
-        for attempt in range(_MAX_RETRIES):
-            try:
-                # Route to native Gemini if we've already confirmed it's needed
-                if self._use_native_gemini:
-                    return self._chat_native_gemini(messages, temperature, max_tokens)
+        Retries 429/503/timeouts against the CURRENT model first, with backoff
+        waits summing to _RATE_LIMIT_TOTAL_WAIT across the retry ladder. Only
+        after that model's full retry budget is exhausted does it rotate to
+        the next model in the pool -- a brief per-minute throttle should
+        clear well within the ladder, so rotating on the first 429 would just
+        abandon a perfectly fine model prematurely.
+        """
+        tried_models: set[str] = set()
 
-                return self._chat_compat(messages, temperature, max_tokens)
-
-            except _GeminiCompatForbidden as exc:
-                # Model not available on OpenAI-compat layer — switch to native.
-                log.warning(
-                    "Gemini compat endpoint returned 403 for model '%s'. "
-                    "Switching to native generateContent API. "
-                    "(Preview/experimental models are often compat-only on native.)",
-                    self.model,
-                )
-                self._use_native_gemini = True
-                # Retry immediately with native — don't count as a rate-limit wait
-                try:
-                    return self._chat_native_gemini(messages, temperature, max_tokens)
-                except httpx.HTTPStatusError as native_exc:
+        while True:
+            # If the current model already hit its daily quota earlier in this
+            # run, don't waste a full retry ladder on it -- skip straight ahead.
+            if self.model in self._daily_exhausted:
+                nxt = self._next_available_model(exclude=tried_models)
+                if nxt is None:
                     raise RuntimeError(
-                        f"Both Gemini endpoints failed. Compat: 403 Forbidden. "
-                        f"Native: {native_exc.response.status_code} — "
-                        f"{native_exc.response.text[:200]}"
-                    ) from native_exc
-
-            except httpx.HTTPStatusError as exc:
-                resp = exc.response
-                if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
-                    # Respect Retry-After header if provided (Gemini sends this).
-                    retry_after = (
-                        resp.headers.get("Retry-After")
-                        or resp.headers.get("X-RateLimit-Reset-Requests")
+                        f"All configured models hit their daily quota: "
+                        f"{sorted(self._daily_exhausted)}. Add more models to "
+                        f"LLM_MODEL_FALLBACKS or wait for quotas to reset."
                     )
-                    if retry_after:
-                        try:
-                            wait = float(retry_after)
-                        except (ValueError, TypeError):
-                            wait = _RATE_LIMIT_BASE_WAIT * (2 ** attempt)
-                    else:
-                        wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
+                self.model = nxt
 
+            # Qwen3 optimization: prepend /no_think to skip chain-of-thought
+            # reasoning, saving tokens on structured extraction tasks.
+            if "qwen" in self.model.lower() and messages:
+                first = messages[0]
+                if first.get("role") == "user" and not first["content"].startswith("/no_think"):
+                    messages = [{"role": first["role"], "content": f"/no_think\n{first['content']}"}] + messages[1:]
+
+            last_exc: Exception | None = None
+
+            for attempt in range(_MAX_RETRIES):
+                try:
+                    # Route to native Gemini if we've already confirmed it's needed
+                    if self._use_native_gemini:
+                        return self._chat_native_gemini(messages, temperature, max_tokens)
+
+                    return self._chat_compat(messages, temperature, max_tokens)
+
+                except _GeminiCompatForbidden as exc:
+                    # Model not available on OpenAI-compat layer — switch to native.
                     log.warning(
-                        "LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d. "
-                        "Tip: Gemini free tier = 15 RPM. Consider a paid account "
-                        "or switching to a local model.",
-                        resp.status_code, wait, attempt + 1, _MAX_RETRIES,
+                        "Gemini compat endpoint returned 403 for model '%s'. "
+                        "Switching to native generateContent API. "
+                        "(Preview/experimental models are often compat-only on native.)",
+                        self.model,
                     )
-                    time.sleep(wait)
-                    continue
-                raise
+                    self._use_native_gemini = True
+                    # Retry immediately with native — don't count as a rate-limit wait
+                    try:
+                        return self._chat_native_gemini(messages, temperature, max_tokens)
+                    except httpx.HTTPStatusError as native_exc:
+                        raise RuntimeError(
+                            f"Both Gemini endpoints failed. Compat: 403 Forbidden. "
+                            f"Native: {native_exc.response.status_code} — "
+                            f"{native_exc.response.text[:200]}"
+                        ) from native_exc
 
-            except httpx.TimeoutException:
-                if attempt < _MAX_RETRIES - 1:
-                    wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
-                    log.warning(
-                        "LLM request timed out, retrying in %ds (attempt %d/%d)",
-                        wait, attempt + 1, _MAX_RETRIES,
-                    )
-                    time.sleep(wait)
-                    continue
-                raise
+                except httpx.HTTPStatusError as exc:
+                    resp = exc.response
+                    last_exc = exc
 
-        raise RuntimeError("LLM request failed after all retries")
+                    if resp.status_code not in (429, 503):
+                        raise
+
+                    if attempt < _MAX_RETRIES - 1:
+                        wait = _BACKOFF_SCHEDULE[attempt]
+                        log.warning(
+                            "LLM rate limited (HTTP %s) on model '%s'. Waiting %.0fs "
+                            "before retry %d/%d.",
+                            resp.status_code, self.model, wait, attempt + 1, _MAX_RETRIES,
+                        )
+                        time.sleep(wait)
+                        continue
+                    break  # retry ladder exhausted for this model -- fall through to rotation
+
+                except httpx.TimeoutException as exc:
+                    last_exc = exc
+                    if attempt < _MAX_RETRIES - 1:
+                        wait = _BACKOFF_SCHEDULE[attempt]
+                        log.warning(
+                            "LLM request timed out on model '%s', retrying in %.0fs "
+                            "(attempt %d/%d)",
+                            self.model, wait, attempt + 1, _MAX_RETRIES,
+                        )
+                        time.sleep(wait)
+                        continue
+                    break
+
+            # Retry ladder exhausted for this model -- try the next one, if any.
+            tried_models.add(self.model)
+            if (
+                isinstance(last_exc, httpx.HTTPStatusError)
+                and last_exc.response.status_code == 429
+                and self._is_gemini
+                and _is_daily_quota_error(last_exc.response)
+            ):
+                # Confirmed daily quota, not a transient throttle -- don't
+                # retry this model again for the rest of the run.
+                self._daily_exhausted.add(self.model)
+
+            nxt = self._next_available_model(exclude=tried_models)
+            if nxt is not None:
+                log.warning(
+                    "Model '%s' exhausted its retry budget. Switching to '%s'.",
+                    self.model, nxt,
+                )
+                self.model = nxt
+                continue
+
+            if last_exc:
+                raise last_exc
+            raise RuntimeError("LLM request failed after all retries")
 
     def ask(self, prompt: str, **kwargs) -> str:
         """Convenience: single user prompt -> assistant response."""
@@ -291,7 +394,11 @@ def get_client() -> LLMClient:
     """Return (or create) the module-level LLMClient singleton."""
     global _instance
     if _instance is None:
-        base_url, model, api_key = _detect_provider()
-        log.info("LLM provider: %s  model: %s", base_url, model)
-        _instance = LLMClient(base_url, model, api_key)
+        base_url, model, api_key, fallbacks = _detect_provider()
+        log.info(
+            "LLM provider: %s  model: %s%s",
+            base_url, model,
+            f"  fallbacks: {fallbacks}" if fallbacks else "",
+        )
+        _instance = LLMClient(base_url, model, api_key, fallback_models=fallbacks)
     return _instance
